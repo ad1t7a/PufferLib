@@ -4,9 +4,11 @@
 //
 // Mirrors the GPU-native task in wujicrawl_warp.py: free-floating right hand
 // on a ground plane learns to crawl, tracking a commanded planar velocity
-// (world frame) sampled per episode. Keep the two in sync — this is the
-// C-MuJoCo reference for sim2sim checks against mjwarp and for consumers of
-// the kalki_env.h ABI without CUDA.
+// sampled per episode. Keep the two in sync — this is the C-MuJoCo reference
+// for sim2sim checks against mjwarp and for consumers of the kalki_env.h ABI
+// without CUDA. In particular every default below must equal the value in
+// config/wujicrawl.ini: a mirror that samples different commands is not a
+// sim2sim reference, it is a second task.
 //
 // Model: control/robots/wuji_hand2/mjcf_right_crawl_rl.xml (built by
 // make_crawl_scene.py): free joint + 20 finger DOF, settled palm-down pose
@@ -32,9 +34,25 @@
 // the post-clamp action rate), so the raw-output overflow penalty cannot be
 // reproduced here without changing the generic env.
 //
-// Task observations (2): commanded (vx, vy), world frame. Base pose/velocity
-// arrive via the generic qpos | qvel block. Note qpos includes world x, y —
-// a non-stationarity leak the curated GPU observation avoids.
+// Commands are sampled in POLAR form (speed in [cmd_speed_lo, cmd_speed_hi],
+// heading in cmd_heading_deg +/- cmd_heading_jitter_deg) and point along the
+// Y AXIS by default. The speed floor is load-bearing: the box sampling it
+// replaces left 24% of episodes with |cmd| < 0.06 m/s, where the sharp
+// tracking kernel is maximized by standing still. Y is the easy axis for a
+// mechanical reason: at the settled pose the wrist's body -z axis (the
+// fingertip direction) lies along world -y, so a y command is driven by the
+// MCP/PIP/DIP flexors (+/-2 N.m at the MCP), while an x command runs across
+// the knuckles and can only come from the abduction joints at +/-0.2 N.m.
+//
+// cmd_frame picks the frame the command and the tracked velocity live in:
+// 0 = world, 1 = the hand's heading frame (the body axis that pointed along
+// world +x at the settled pose). See config/wujicrawl.ini.
+//
+// Task observations (2): commanded (vx, vy) in that frame. Base pose and
+// velocity arrive via the generic qpos | qvel block, always in world/raw
+// form — under cmd_frame = 1 the policy has to rotate them itself, which the
+// curated GPU observation does for it. Note qpos also includes world x, y —
+// a non-stationarity leak the GPU observation avoids.
 
 #include <cmath>
 #include <cstdio>
@@ -49,10 +67,12 @@ namespace {
 constexpr int kNq = 27;  // 7 free + 20 fingers
 constexpr int kNv = 26;  // 6 free + 20 fingers
 constexpr int kNu = 20;
+constexpr float kDeg2Rad = 3.14159265358979323846f / 180.0f;  // M_PI is not ISO
 
 // Resolved once by kalki_task_init; read-only afterwards.
 int g_home_key = -1;
 mjtNum g_down_body[3];        // settled pose's floor-facing axis, body frame
+mjtNum g_fwd_body[3];         // body axis that pointed along world +x at home
 int g_finger_qposadr[kNu];    // actuator i -> qpos address of its joint
 int g_finger_dofadr[kNu];     // actuator i -> dof address of its joint
 
@@ -65,10 +85,11 @@ float g_w_action_rate = -0.01f;
 float g_w_ang_vel = -0.001f;
 float g_w_qvel = -0.005f;
 float g_w_flip = -10.0f;
-float g_cmd_vx_lo = -0.15f;  // backward (-x): the easy direction for this hand
-float g_cmd_vx_hi = -0.08f;
-
-float g_cmd_vy_max = 0.0f;
+float g_cmd_speed_lo = 0.08f;        // > 0: standing still is never on-command
+float g_cmd_speed_hi = 0.15f;
+float g_cmd_heading_deg = -90.0f;    // -90 = -y: the flexor (fingertip) axis
+float g_cmd_heading_jitter_deg = 30.0f;
+int g_cmd_frame = 0;                 // 0 = world, 1 = hand heading frame
 float g_reset_noise = 0.2f;
 float g_success_vel_radius = 0.05f;  // m/s, |v_xy - cmd| for success logging
 
@@ -76,6 +97,33 @@ float g_success_vel_radius = 0.05f;  // m/s, |v_xy - cmd| for success logging
 struct CrawlState {
   float cmd[2];
 };
+
+// Planar base velocity in the frame commands are expressed in. cmd_frame 0
+// leaves it in world; 1 rotates it into the hand's heading frame, whose
+// direction is the world-xy projection of g_fwd_body. Taken as sin/cos off
+// that vector — no atan2. Degenerate when the hand is nose-up/nose-down and
+// the projection vanishes; world frame there. Mirrors track_vel() in
+// wujicrawl_warp.py.
+void track_vel(const mjData* d, float* vx, float* vy) {
+  *vx = (float)d->qvel[0];
+  *vy = (float)d->qvel[1];
+  if (g_cmd_frame == 0) {
+    return;
+  }
+  mjtNum q[4] = {d->qpos[3], d->qpos[4], d->qpos[5], d->qpos[6]};
+  mju_normalize4(q);
+  mjtNum fwd[3];
+  mju_rotVecQuat(fwd, g_fwd_body, q);
+  const float n = sqrtf((float)(fwd[0] * fwd[0] + fwd[1] * fwd[1]));
+  if (n < 1e-6f) {
+    return;
+  }
+  const float c = (float)fwd[0] / n;
+  const float sn = (float)fwd[1] / n;
+  const float wx = *vx, wy = *vy;
+  *vx = c * wx + sn * wy;
+  *vy = -sn * wx + c * wy;
+}
 
 }  // namespace
 
@@ -120,6 +168,11 @@ int kalki_task_init(const mjModel* m, char* err, int err_sz) {
   mju_negQuat(conj, wq);
   const mjtNum down_world[3] = {0.0, 0.0, -1.0};
   mju_rotVecQuat(g_down_body, down_world, conj);
+  // Heading reference: the body axis that pointed along world +x at the
+  // settled pose, so heading 0 means the same thing in both cmd_frames at
+  // reset. Its world-xy projection is the hand's "facing".
+  const mjtNum fwd_world[3] = {1.0, 0.0, 0.0};
+  mju_rotVecQuat(g_fwd_body, fwd_world, conj);
   return 0;
 }
 
@@ -141,9 +194,12 @@ int kalki_task_set_param(const char* key, double value) {
   else if (!strcmp(key, "w_ang_vel")) g_w_ang_vel = (float)value;
   else if (!strcmp(key, "w_qvel")) g_w_qvel = (float)value;
   else if (!strcmp(key, "w_flip")) g_w_flip = (float)value;
-  else if (!strcmp(key, "cmd_vx_lo")) g_cmd_vx_lo = (float)value;
-  else if (!strcmp(key, "cmd_vx_hi")) g_cmd_vx_hi = (float)value;
-  else if (!strcmp(key, "cmd_vy_max")) g_cmd_vy_max = (float)value;
+  else if (!strcmp(key, "cmd_speed_lo")) g_cmd_speed_lo = (float)value;
+  else if (!strcmp(key, "cmd_speed_hi")) g_cmd_speed_hi = (float)value;
+  else if (!strcmp(key, "cmd_heading_deg")) g_cmd_heading_deg = (float)value;
+  else if (!strcmp(key, "cmd_heading_jitter_deg"))
+    g_cmd_heading_jitter_deg = (float)value;
+  else if (!strcmp(key, "cmd_frame")) g_cmd_frame = (int)value;
   else if (!strcmp(key, "reset_noise")) g_reset_noise = (float)value;
   else if (!strcmp(key, "success_vel_radius")) g_success_vel_radius = (float)value;
   else return -1;
@@ -175,8 +231,15 @@ void kalki_task_reset(const mjModel* m, mjData* d, void* state,
   d->qvel[1] = (mjtNum)kalki_rng_uniform(rng, -0.5f * g_reset_noise,
                                          0.5f * g_reset_noise);
 
-  s->cmd[0] = kalki_rng_uniform(rng, g_cmd_vx_lo, g_cmd_vx_hi);
-  s->cmd[1] = kalki_rng_uniform(rng, -g_cmd_vy_max, g_cmd_vy_max);
+  // Polar: a speed floor (g_cmd_speed_lo > 0) guarantees every episode is
+  // off-command while standing still. Independent vx/vy boxes do not — they
+  // concentrate mass near |cmd| = 0, where freezing maximizes the kernel.
+  const float speed = kalki_rng_uniform(rng, g_cmd_speed_lo, g_cmd_speed_hi);
+  const float jitter = g_cmd_heading_jitter_deg * kDeg2Rad;
+  const float heading = g_cmd_heading_deg * kDeg2Rad +
+                        kalki_rng_uniform(rng, -jitter, jitter);
+  s->cmd[0] = speed * cosf(heading);
+  s->cmd[1] = speed * sinf(heading);
 }
 
 void kalki_task_obs(const mjModel* m, const mjData* d, const void* state,
@@ -193,8 +256,8 @@ float kalki_task_reward(const mjModel* m, const mjData* d, void* state,
   (void)m;
   const CrawlState* s = (const CrawlState*)state;
 
-  const float vx = (float)d->qvel[0];  // world frame
-  const float vy = (float)d->qvel[1];
+  float vx, vy;         // planar base velocity in the command's frame
+  track_vel(d, &vx, &vy);
   const float wx = (float)d->qvel[3];  // body frame; |omega|^2 only
   const float wy = (float)d->qvel[4];
   const float wz = (float)d->qvel[5];
@@ -207,8 +270,9 @@ float kalki_task_reward(const mjModel* m, const mjData* d, void* state,
   mju_rotVecQuat(down_world, g_down_body, q);
   *terminate = down_world[2] > 0.5;
 
-  // Sharp tracking kernel: standing still under the minimum 0.08 m/s
-  // command earns only ~0.04; see the header comment on passive stability.
+  // Sharp tracking kernel: standing still under the slowest sampled command
+  // (cmd_speed_lo = 0.08 m/s) earns only ~0.04, which is why that floor has
+  // to stay above ~0.06; see the header comment on passive stability.
   const float dvx = vx - s->cmd[0];
   const float dvy = vy - s->cmd[1];
   const float track = expf(-(dvx * dvx + dvy * dvy) / 0.002f);

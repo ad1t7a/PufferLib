@@ -1,5 +1,6 @@
 /* Wuji Hand2 CRAWL, GPU-NATIVE via mujoco_warp: free-floating hand learns to
- * crawl on the ground, tracking a commanded planar velocity. Task lives in
+ * crawl on the ground, tracking a commanded planar velocity (y axis by
+ * default — see config/wujicrawl.ini). Task lives in
  * wujicrawl_warp.py; the C/CUDA mechanism is the shared src/mjwarp_host.cuh
  * (via wujicrawl_host.cu).
  */
@@ -9,7 +10,9 @@ typedef struct {
     float episode_return;
     float episode_length;
     float perf;   /* mean velocity-tracking kernel over the episode */
-    float score;  /* displacement along the commanded heading (meters) */
+    float score;  /* metres travelled along the commanded direction,
+                     integrated over the episode (frame-correct under
+                     cmd_frame = 1, where that direction rotates) */
     float n;      /* required last field */
 } Log;
 

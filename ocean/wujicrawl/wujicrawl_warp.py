@@ -7,11 +7,33 @@ make_crawl_scene.py): right hand with a free joint on a ground plane,
 settled palm-down pose stored as keyframe "home".
   nq = 7 + 20 (free joint + fingers), nv = 6 + 20, nu = 20.
 
-Task: track a commanded planar velocity (world frame), sampled per episode.
-Commands are BACKWARD (-x) by default — the hand's natural drift direction;
-+x locomotion proved much harder for this morphology. score logs
-displacement along the commanded heading, so positive is always good.
-  reward = max(0, w_track * exp(-|v_xy - cmd|^2 / 0.002) + w_vel * progress
+Task: track a commanded planar velocity, sampled per episode in POLAR form:
+speed uniform in [cmd_speed_lo, cmd_speed_hi], heading uniform in a sector of
+half-width cmd_heading_jitter_deg around cmd_heading_deg. The speed FLOOR is
+load-bearing — the box sampling it replaces (vx, vy drawn independently from
++/-0.08 and +/-0.15) left 24% of episodes with |cmd| < 0.06 m/s, and under a
+sigma^2 = 0.002 tracking kernel a near-zero command is maximized by freezing.
+A quarter of the batch was training the exact stand-still optimum every other
+term in this reward exists to defeat.
+
+Commands point along the Y AXIS by default (cmd_heading_deg = -90). At the
+settled pose the wrist's body -z axis — the fingertip direction — points
+along world -y, so a y command is served by the MCP/PIP/DIP FLEXORS (+/-2 N.m
+forcerange at the MCP) pulling the palm toward planted fingertips. An x
+command runs across the knuckles and has to come from the ABDUCTION joints,
+forcerange +/-0.2 N.m: ten times weaker. That actuator asymmetry, not a quirk
+of the search, is why y is the easy direction for this morphology.
+
+cmd_frame picks the frame the command and the tracked velocity live in:
+  0 = world (default) — heading measured from world +x, fixed all episode.
+  1 = heading — measured from the hand's own facing (the body axis that
+      pointed along world +x at the settled pose), so a y command stays on
+      the fingertip axis as the hand yaws. In world frame the command is
+      pinned while the hand rotates under it, so any yaw drift the gait
+      induces steadily rotates the task off the flexor axis that made y
+      easy in the first place.
+
+  reward = max(0, w_track * exp(-|v_track - cmd|^2 / 0.002) + w_vel * progress
                + w_alive + w_action_rate * rate + w_overflow * over
                + w_qvel * qv_pen + w_ang_vel * |omega_body|^2)
            + w_flip * [flipped]
@@ -20,9 +42,14 @@ displacement along the commanded heading, so positive is always good.
   terminate on flip (settled "down" axis points up) or divergence;
   truncate at max_episode_len.
 
+score integrates velocity along the commanded direction over the episode
+(meters, unclipped). Final-position displacement is only correct when the
+commanded world direction is constant; integrating stays correct under
+cmd_frame = 1, where it rotates with the hand.
+
 Observation (75):
   base rot 6D (2 world-frame rotation matrix columns)  6
-  base linear velocity, world frame                    3
+  base linear velocity (xy in the cmd_frame, z world)  3
   base angular velocity, body frame                    3
   base height z                                        1
   finger qpos                                         20
@@ -111,6 +138,28 @@ def u01(x: wp.uint32) -> float:
     return float(x >> wp.uint32(8)) * (1.0 / 16777216.0)
 
 
+# Planar velocity in the frame commands are expressed in. cmd_frame 0 leaves
+# it in world; 1 rotates it into the hand's heading frame, where "heading" is
+# the world-xy direction of fwd_body (the body axis that pointed along world
+# +x at the settled pose). Uses the sin/cos of the yaw directly off that
+# vector — no atan2, and no branch on quadrant. Degenerate when the hand is
+# nose-up/nose-down and fwd has no xy component; world frame there.
+@wp.func
+def track_vel(q: wp.quat, linvel: wp.vec3, fwd_body: wp.vec3,
+              cmd_frame: int) -> wp.vec3:
+    vx = linvel[0]
+    vy = linvel[1]
+    if cmd_frame != 0:
+        f = wp.quat_rotate(q, fwd_body)
+        n = wp.sqrt(f[0] * f[0] + f[1] * f[1])
+        if n > 1.0e-6:
+            c = f[0] / n
+            s = f[1] / n
+            vx = c * linvel[0] + s * linvel[1]
+            vy = -s * linvel[0] + c * linvel[1]
+    return wp.vec3(vx, vy, linvel[2])
+
+
 # Episode reset shared by k_reset and k_post's auto-reset: settled keyframe
 # + reset randomization (finger pose jitter within actuator limits, small
 # random base push) + fresh command. Every env starting from the identical
@@ -123,8 +172,9 @@ def reset_env(e: int,
               prev: wp.array2d(dtype=float), cmd: wp.array2d(dtype=float),
               key_qpos: wp.array(dtype=float),
               ctrl_lo: wp.array(dtype=float), ctrl_hi: wp.array(dtype=float),
-              reset_noise: float, cmd_vx_lo: float, cmd_vx_hi: float,
-              cmd_vy_max: float, x: wp.uint32) -> wp.uint32:
+              reset_noise: float, cmd_speed_lo: float, cmd_speed_hi: float,
+              cmd_heading: float, cmd_jitter: float,
+              x: wp.uint32) -> wp.uint32:
     for i in range(NQ):
         qpos[e, i] = key_qpos[i]
     for i in range(NV):
@@ -139,16 +189,22 @@ def reset_env(e: int,
     qvel[e, 0] = 0.5 * reset_noise * (2.0 * u01(x) - 1.0)
     x = xs32(x)
     qvel[e, 1] = 0.5 * reset_noise * (2.0 * u01(x) - 1.0)
+    # Polar: a speed FLOOR (cmd_speed_lo > 0) guarantees every episode is
+    # off-command while standing still. Sampling vx and vy independently in
+    # boxes does not — it concentrates mass near |cmd| = 0, where freezing
+    # maximizes the tracking kernel.
     x = xs32(x)
-    cmd[e, 0] = cmd_vx_lo + u01(x) * (cmd_vx_hi - cmd_vx_lo)
+    speed = cmd_speed_lo + u01(x) * (cmd_speed_hi - cmd_speed_lo)
     x = xs32(x)
-    cmd[e, 1] = (2.0 * u01(x) - 1.0) * cmd_vy_max
+    ang = cmd_heading + cmd_jitter * (2.0 * u01(x) - 1.0)
+    cmd[e, 0] = speed * wp.cos(ang)
+    cmd[e, 1] = speed * wp.sin(ang)
     return x
 
 
 @wp.func
 def write_crawl_obs(obs: wp.array2d(dtype=float), e: int,
-                    q: wp.quat, linvel: wp.vec3, angvel: wp.vec3, z: float,
+                    q: wp.quat, tvel: wp.vec3, angvel: wp.vec3, z: float,
                     qpos: wp.array2d(dtype=float),
                     qvel: wp.array2d(dtype=float),
                     prev: wp.array2d(dtype=float),
@@ -161,9 +217,12 @@ def write_crawl_obs(obs: wp.array2d(dtype=float), e: int,
     obs[e, 3] = cy[0]
     obs[e, 4] = cy[1]
     obs[e, 5] = cy[2]
-    obs[e, 6] = linvel[0]
-    obs[e, 7] = linvel[1]
-    obs[e, 8] = linvel[2]
+    # xy in the same frame the command and the reward use (see track_vel),
+    # so the policy is not left to infer the rotation from rot6d itself; z
+    # is world either way.
+    obs[e, 6] = tvel[0]
+    obs[e, 7] = tvel[1]
+    obs[e, 8] = tvel[2]
     obs[e, 9] = 0.25 * angvel[0]
     obs[e, 10] = 0.25 * angvel[1]
     obs[e, 11] = 0.25 * angvel[2]
@@ -188,15 +247,18 @@ def k_post(qpos: wp.array2d(dtype=float), qvel: wp.array2d(dtype=float),
            over: wp.array(dtype=float),
            cmd: wp.array2d(dtype=float),
            tick: wp.array(dtype=int), track_sum: wp.array(dtype=float),
+           prog_sum: wp.array(dtype=float),
            ep_ret: wp.array(dtype=float), rng: wp.array(dtype=wp.uint32),
            obs: wp.array2d(dtype=float), rewards: wp.array(dtype=float),
            terminals: wp.array(dtype=float),
            key_qpos: wp.array(dtype=float), down_body: wp.vec3,
+           fwd_body: wp.vec3,
            ctrl_lo: wp.array(dtype=float), ctrl_hi: wp.array(dtype=float),
            log: wp.array(dtype=float),
            max_len: int, w_track: float, w_vel: float, w_alive: float,
-           w_rate: float, w_ang: float, cmd_vx_lo: float, cmd_vx_hi: float,
-           cmd_vy_max: float, reset_noise: float, w_overflow: float,
+           w_rate: float, w_ang: float, cmd_speed_lo: float,
+           cmd_speed_hi: float, cmd_heading: float, cmd_jitter: float,
+           cmd_frame: int, dt: float, reset_noise: float, w_overflow: float,
            w_qvel: float, w_flip: float):
     e = wp.tid()
 
@@ -220,18 +282,23 @@ def k_post(qpos: wp.array2d(dtype=float), qvel: wp.array2d(dtype=float),
 
     # This hand is PASSIVELY STABLE: unlike a biped, doing nothing costs
     # nothing physically, so the reward must make standing still clearly
-    # unprofitable. Tracking kernel is sharp (sigma^2 = 0.002: standing
-    # under the minimum 0.08 m/s command earns only ~0.04), and the dominant
-    # term is linear progress toward the command, CLIPPED at the commanded
-    # speed (linear gradient from v=0, no overshoot incentive beyond it).
-    dvx = linvel[0] - cmd[e, 0]
-    dvy = linvel[1] - cmd[e, 1]
+    # unprofitable. Tracking kernel is sharp (sigma^2 = 0.002: standing under
+    # the slowest sampled command, cmd_speed_lo = 0.08 m/s, earns only ~0.04
+    # — which is why that floor must stay above ~0.06), and the dominant term
+    # is linear progress toward the command, CLIPPED at the commanded speed
+    # (linear gradient from v=0, no overshoot incentive beyond it).
+    tv = track_vel(q, linvel, fwd_body, cmd_frame)
+    dvx = tv[0] - cmd[e, 0]
+    dvy = tv[1] - cmd[e, 1]
     track = wp.exp(-(dvx * dvx + dvy * dvy) / 0.002)
     cnorm = wp.sqrt(cmd[e, 0] * cmd[e, 0] + cmd[e, 1] * cmd[e, 1])
+    vdot = float(0.0)  # signed speed along the command, unclipped (score)
     progress = float(0.0)
     if cnorm > 1.0e-6:
-        progress = (linvel[0] * cmd[e, 0] + linvel[1] * cmd[e, 1]) / cnorm
-        progress = wp.min(progress, cnorm)
+        vdot = (tv[0] * cmd[e, 0] + tv[1] * cmd[e, 1]) / cnorm
+        if vdot != vdot:  # guard before it accumulates into prog_sum
+            vdot = 0.0
+        progress = wp.min(vdot, cnorm)
     # w_overflow penalizes RAW policy outputs beyond [-1,1] (see k_pre):
     # without it the action means drift far outside the clamp, where PPO's
     # gradient signal about behavior vanishes (observed |mu| ~ 38).
@@ -259,6 +326,7 @@ def k_post(qpos: wp.array2d(dtype=float), qvel: wp.array2d(dtype=float),
 
     t = tick[e] + 1
     ts = track_sum[e] + track
+    ps = prog_sum[e] + vdot * dt  # meters travelled along the command
     ret = ep_ret[e] + reward
 
     done = int(0)
@@ -272,57 +340,58 @@ def k_post(qpos: wp.array2d(dtype=float), qvel: wp.array2d(dtype=float),
         wp.atomic_add(log, 0, ret)                # episode_return
         wp.atomic_add(log, 1, float(t))           # episode_length
         wp.atomic_add(log, 2, ts / float(t))      # perf: mean tracking kernel
-        # score: displacement along the commanded heading (base resets to
-        # x,y ~ 0, so final position = episode displacement). Sign-safe for
-        # backward (-x) commands: positive score = went where it was told.
-        x_final = qpos[e, 0]
-        y_final = qpos[e, 1]
-        if x_final != x_final:
-            x_final = 0.0
-        if y_final != y_final:
-            y_final = 0.0
-        disp = float(0.0)
-        if cnorm > 1.0e-6:
-            disp = (x_final * cmd[e, 0] + y_final * cmd[e, 1]) / cnorm
-        wp.atomic_add(log, 3, disp)
+        # score: metres travelled along the commanded direction, integrated
+        # over the episode. Final-position displacement only works while the
+        # commanded WORLD direction is constant; under cmd_frame = 1 it
+        # rotates with the hand, and the integral is the frame-correct form.
+        # Positive is always good, whatever heading was sampled.
+        wp.atomic_add(log, 3, ps)
         wp.atomic_add(log, 4, 1.0)                # n
         rng[e] = reset_env(e, qpos, qvel, prev, cmd, key_qpos, ctrl_lo,
-                           ctrl_hi, reset_noise, cmd_vx_lo, cmd_vx_hi,
-                           cmd_vy_max, rng[e])
+                           ctrl_hi, reset_noise, cmd_speed_lo, cmd_speed_hi,
+                           cmd_heading, cmd_jitter, rng[e])
         q = base_quat(qpos, e)
-        linvel = wp.vec3(qvel[e, 0], qvel[e, 1], 0.0)
+        tv = track_vel(q, wp.vec3(qvel[e, 0], qvel[e, 1], 0.0), fwd_body,
+                       cmd_frame)
         angvel = wp.vec3(0.0, 0.0, 0.0)
         z = qpos[e, 2]
         t = 0
         ts = 0.0
+        ps = 0.0
         ret = 0.0
 
     tick[e] = t
     track_sum[e] = ts
+    prog_sum[e] = ps
     ep_ret[e] = ret
 
-    write_crawl_obs(obs, e, q, linvel, angvel, z, qpos, qvel, prev, cmd)
+    write_crawl_obs(obs, e, q, tv, angvel, z, qpos, qvel, prev, cmd)
 
 
 @wp.kernel
 def k_reset(qpos: wp.array2d(dtype=float), qvel: wp.array2d(dtype=float),
             prev: wp.array2d(dtype=float), cmd: wp.array2d(dtype=float),
             tick: wp.array(dtype=int), track_sum: wp.array(dtype=float),
+            prog_sum: wp.array(dtype=float),
             ep_ret: wp.array(dtype=float), rng: wp.array(dtype=wp.uint32),
             obs: wp.array2d(dtype=float),
-            key_qpos: wp.array(dtype=float),
+            key_qpos: wp.array(dtype=float), fwd_body: wp.vec3,
             ctrl_lo: wp.array(dtype=float), ctrl_hi: wp.array(dtype=float),
-            cmd_vx_lo: float, cmd_vx_hi: float, cmd_vy_max: float,
-            reset_noise: float):
+            cmd_speed_lo: float, cmd_speed_hi: float, cmd_heading: float,
+            cmd_jitter: float, cmd_frame: int, reset_noise: float):
     e = wp.tid()
     rng[e] = reset_env(e, qpos, qvel, prev, cmd, key_qpos, ctrl_lo, ctrl_hi,
-                       reset_noise, cmd_vx_lo, cmd_vx_hi, cmd_vy_max, rng[e])
+                       reset_noise, cmd_speed_lo, cmd_speed_hi, cmd_heading,
+                       cmd_jitter, rng[e])
     tick[e] = 0
     track_sum[e] = 0.0
+    prog_sum[e] = 0.0
     ep_ret[e] = 0.0
     q = base_quat(qpos, e)
-    write_crawl_obs(obs, e, q, wp.vec3(qvel[e, 0], qvel[e, 1], 0.0),
-                    wp.vec3(0.0, 0.0, 0.0), qpos[e, 2], qpos, qvel, prev, cmd)
+    tv = track_vel(q, wp.vec3(qvel[e, 0], qvel[e, 1], 0.0), fwd_body,
+                   cmd_frame)
+    write_crawl_obs(obs, e, q, tv, wp.vec3(0.0, 0.0, 0.0), qpos[e, 2],
+                    qpos, qvel, prev, cmd)
 
 
 def _wrap(ptr, shape, dev):
@@ -333,8 +402,8 @@ def init(total_agents, num_buffers, seed,
          act_ptr, obs_ptr, rew_ptr, term_ptr,
          max_episode_len, decimation, action_scale,
          w_track, w_vel, w_alive, w_action_rate, w_ang_vel,
-         cmd_vx_lo, cmd_vx_hi, cmd_vy_max, reset_noise, w_overflow, w_qvel,
-         w_flip):
+         cmd_speed_lo, cmd_speed_hi, cmd_heading_deg, cmd_heading_jitter_deg,
+         cmd_frame, reset_noise, w_overflow, w_qvel, w_flip):
     wp.init()
     dev = "cuda:0"
     assert total_agents % num_buffers == 0
@@ -353,6 +422,20 @@ def init(total_agents, num_buffers, seed,
     mujoco.mju_quat2Mat(rot, wq)
     R = rot.reshape(3, 3)
     down_body_np = R.T @ np.array([0.0, 0.0, -1.0])
+    # Body-frame heading reference: the body axis that pointed along world +x
+    # at the settled pose. Its world-xy direction is the hand's "facing", so
+    # heading 0 means the same thing in both cmd_frames at reset.
+    fwd_body_np = R.T @ np.array([1.0, 0.0, 0.0])
+
+    cmd_speed_lo = float(cmd_speed_lo)
+    cmd_speed_hi = float(cmd_speed_hi)
+    assert 0.0 < cmd_speed_lo <= cmd_speed_hi, (
+        "cmd_speed_lo must be > 0 (a zero-speed command makes standing still "
+        "optimal under the tracking kernel) and <= cmd_speed_hi")
+    cmd_heading = np.radians(float(cmd_heading_deg))
+    cmd_jitter = np.radians(float(cmd_heading_jitter_deg))
+    # Control-step duration, for integrating the score in metres.
+    step_dt = float(mjm.opt.timestep) * int(decimation)
 
     consts = {
         "key_qpos": wp.array(key_qpos_np, dtype=wp.float32, device=dev),
@@ -361,6 +444,7 @@ def init(total_agents, num_buffers, seed,
         "log": wp.zeros(5, dtype=wp.float32, device=dev),
     }
     down_body = wp.vec3(*[float(v) for v in down_body_np])
+    fwd_body = wp.vec3(*[float(v) for v in fwd_body_np])
 
     wm = mjw.put_model(mjm)
     wm.opt.warn_overflow = False  # solver caps are deliberate (RL settings)
@@ -377,6 +461,7 @@ def init(total_agents, num_buffers, seed,
             "over": wp.zeros(apb, dtype=wp.float32, device=dev),
             "tick": wp.zeros(apb, dtype=wp.int32, device=dev),
             "track_sum": wp.zeros(apb, dtype=wp.float32, device=dev),
+            "prog_sum": wp.zeros(apb, dtype=wp.float32, device=dev),
             "ep_ret": wp.zeros(apb, dtype=wp.float32, device=dev),
             "rng": wp.array((np.arange(apb, dtype=np.uint32) * 2654435761 + seed + b + 1) | 1,
                             dtype=wp.uint32, device=dev),
@@ -390,11 +475,13 @@ def init(total_agents, num_buffers, seed,
     def launch_reset(st):
         wp.launch(k_reset, dim=apb,
                   inputs=[st["d"].qpos, st["d"].qvel, st["prev"], st["cmd"],
-                          st["tick"], st["track_sum"], st["ep_ret"], st["rng"],
-                          st["obs"], consts["key_qpos"],
+                          st["tick"], st["track_sum"], st["prog_sum"],
+                          st["ep_ret"], st["rng"],
+                          st["obs"], consts["key_qpos"], fwd_body,
                           consts["ctrl_lo"], consts["ctrl_hi"],
-                          float(cmd_vx_lo), float(cmd_vx_hi),
-                          float(cmd_vy_max), float(reset_noise)], device=dev)
+                          float(cmd_speed_lo), float(cmd_speed_hi),
+                          float(cmd_heading), float(cmd_jitter),
+                          int(cmd_frame), float(reset_noise)], device=dev)
 
     def launch_step(st):
         wp.launch(k_pre, dim=apb,
@@ -405,14 +492,16 @@ def init(total_agents, num_buffers, seed,
             mjw.step(wm, st["d"])
         wp.launch(k_post, dim=apb,
                   inputs=[st["d"].qpos, st["d"].qvel, st["prev"], st["rate"],
-                          st["over"], st["cmd"], st["tick"], st["track_sum"], st["ep_ret"],
+                          st["over"], st["cmd"], st["tick"], st["track_sum"],
+                          st["prog_sum"], st["ep_ret"],
                           st["rng"], st["obs"], st["rewards"], st["terminals"],
-                          consts["key_qpos"], down_body,
+                          consts["key_qpos"], down_body, fwd_body,
                           consts["ctrl_lo"], consts["ctrl_hi"], consts["log"],
                           int(max_episode_len), float(w_track), float(w_vel),
                           float(w_alive), float(w_action_rate), float(w_ang_vel),
-                          float(cmd_vx_lo), float(cmd_vx_hi),
-                          float(cmd_vy_max), float(reset_noise),
+                          float(cmd_speed_lo), float(cmd_speed_hi),
+                          float(cmd_heading), float(cmd_jitter),
+                          int(cmd_frame), float(step_dt), float(reset_noise),
                           float(w_overflow), float(w_qvel),
                           float(w_flip)], device=dev)
 
@@ -471,8 +560,10 @@ def render():
         d = mujoco.MjData(state["mjm"])
         _viewer["d"] = d
         _viewer["v"] = mujoco.viewer.launch_passive(state["mjm"], d)
-        _viewer["cmd"] = (float(os.environ.get("WUJICRAWL_VIEW_VX", "-0.15")),
-                          float(os.environ.get("WUJICRAWL_VIEW_VY", "0.0")))
+        # Default matches the trained command: y axis, at the top of the
+        # sampled speed range. Components are in the cmd_frame the run used.
+        _viewer["cmd"] = (float(os.environ.get("WUJICRAWL_VIEW_VX", "0.0")),
+                          float(os.environ.get("WUJICRAWL_VIEW_VY", "-0.15")))
         _viewer["t"] = time.perf_counter()
         _viewer["dt"] = 0.008  # control step (dt 0.004 x decimation 2)
 
