@@ -452,6 +452,23 @@ __device__ __forceinline__ float safe_continuous_logstd(const precision_t* logst
     return finite_or_clamp(to_float(logstd[idx]), -20.0f, 2.0f);
 }
 
+// Bounds for the logstd PARAMETER itself, projected after every optimizer
+// step. safe_continuous_logstd only clamps at sample/logprob time; the
+// parameter is otherwise unbounded, and once the action mean runs away the
+// PPO logstd gradient ((a-mu)^2/sigma^2 - 1) stays positive and diverges
+// (observed logstd +29 / |mu|~1e5 on wujicrawl). Tighter than the sampling
+// clamp so a policy pinned at the wall still behaves sanely and can recover.
+#define LOGSTD_PARAM_MIN -4.0f
+#define LOGSTD_PARAM_MAX 1.0f
+
+__global__ void clamp_logstd_param(float* logstd, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = logstd[i];
+    if (!isfinite(v)) v = 0.0f;
+    logstd[i] = fminf(LOGSTD_PARAM_MAX, fmaxf(LOGSTD_PARAM_MIN, v));
+}
+
 __device__ __forceinline__ float masked_logit(const precision_t* logits,
         int logits_base, int logits_offset, int offset,
         const precision_t* mask, int mask_base) {
@@ -1696,6 +1713,16 @@ void train_impl(PuffeRL& pufferl) {
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
 
             muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
+            if (dw_train->continuous) {
+                // Project logstd back into [LOGSTD_PARAM_MIN, LOGSTD_PARAM_MAX]
+                // on the fp32 master copy (the bf16 cast below propagates it).
+                // dw_train->logstd aliases param_puf, so its element offset
+                // locates the same slice inside master_weights.
+                long logstd_off = (long)(dw_train->logstd.data - pufferl.param_puf.data);
+                int logstd_n = numel(dw_train->logstd.shape);
+                clamp_logstd_param<<<grid_size(logstd_n), BLOCK_SIZE, 0, stream>>>(
+                    pufferl.master_weights.data + logstd_off, logstd_n);
+            }
             if (USE_BF16) {
                 int n = numel(pufferl.param_puf.shape);
                 cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(

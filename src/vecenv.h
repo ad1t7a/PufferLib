@@ -209,6 +209,23 @@ extern const char* cudaGetErrorString(cudaError_t);
 void my_init(Env* env, Dict* kwargs);
 void my_log(Log* log, Dict* out);
 
+#ifdef MY_GPU_NATIVE
+// GPU-native env hooks: the env steps entirely on device, in place, on the
+// vecenv device buffers (see ocean/wujigpu). my_gpu_init receives the base
+// device pointers once so implementations may pre-capture CUDA graphs per
+// buffer slice; my_gpu_step_range MUST be safe to call without the GIL (it
+// runs on OMP worker threads) — pure CUDA API calls only.
+void my_gpu_init(int total_agents, int num_buffers, unsigned int seed,
+                 float* gpu_actions, void* gpu_observations,
+                 float* gpu_rewards, float* gpu_terminals);
+void my_gpu_reset(void* gpu_observations);
+void my_gpu_step_range(void* stream, int agent_start, int count,
+                       const float* gpu_actions, void* gpu_obs,
+                       float* gpu_rewards, float* gpu_terminals);
+float my_gpu_log_into(void* log_out);  // fills Log SUMS, returns n episodes
+void my_gpu_close(void);
+#endif
+
 #ifdef MY_USES_PERM
 // Env-provided: populate per-slot pointer arrays on env, given the global slot
 // base for slot 0. Reads vec->agent_perm (NULL = identity) to compute physical
@@ -276,6 +293,25 @@ static void* static_omp_threadmanager(void* arg) {
             clock_gettime(CLOCK_MONOTONIC, &t0);
             net_callback(ctx, buf, t);
 
+#ifdef MY_GPU_NATIVE
+            (void)envs; (void)env_start; (void)env_count;
+            cudaStreamSynchronize(stream);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            my_accum[EVAL_GPU] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
+
+            // Envs live on the GPU: step this buffer's agent range in place on
+            // the vecenv device buffers (no D2H/H2D, no host memsets — the env
+            // writes every reward/terminal entry each step).
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            my_gpu_step_range(stream, agent_start, agents_per_buffer,
+                &vec->gpu_actions[agent_start * NUM_ATNS],
+                (char*)vec->gpu_observations + (size_t)agent_start * OBS_SIZE * obs_element_size(),
+                &vec->gpu_rewards[agent_start],
+                &vec->gpu_terminals[agent_start]);
+            cudaStreamSynchronize(stream);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            my_accum[EVAL_ENV_STEP] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
+#else
             cudaMemcpyAsync(
                 &vec->actions[agent_start * NUM_ATNS],
                 &vec->gpu_actions[agent_start * NUM_ATNS],
@@ -317,6 +353,7 @@ static void* static_omp_threadmanager(void* arg) {
                 agents_per_buffer * MY_ACTION_MASK * sizeof(unsigned char),
                 cudaMemcpyHostToDevice, stream);
 #endif
+#endif  // MY_GPU_NATIVE
         }
         cudaStreamSynchronize(stream);
         atomic_store(&buffer_states[buf], OMP_WAITING);
@@ -433,6 +470,12 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
         cudaMemset(vec->gpu_actions, 0, total_agents * NUM_ATNS * sizeof(float));
         cudaMemset(vec->gpu_rewards, 0, total_agents * sizeof(float));
         cudaMemset(vec->gpu_terminals, 0, total_agents * sizeof(float));
+#ifdef MY_GPU_NATIVE
+        // env kwargs (via my_init) have already been applied at this point
+        my_gpu_init(total_agents, num_buffers, 12345u,
+                    vec->gpu_actions, vec->gpu_observations,
+                    vec->gpu_rewards, vec->gpu_terminals);
+#endif
     } else {
         vec->observations = calloc(total_agents * OBS_SIZE, obs_elem_size);
         vec->actions = (float*)calloc(total_agents * NUM_ATNS, sizeof(float));
@@ -562,6 +605,15 @@ int static_vec_count_aligned(StaticVec* vec, int tag_value, int reset_flags) {
 #endif
 
 void static_vec_reset(StaticVec* vec) {
+#ifdef MY_GPU_NATIVE
+    if (vec->gpu) {
+        my_gpu_reset(vec->gpu_observations);
+        cudaMemset(vec->gpu_rewards,   0, vec->total_agents * sizeof(float));
+        cudaMemset(vec->gpu_terminals, 0, vec->total_agents * sizeof(float));
+        cudaDeviceSynchronize();
+        return;
+    }
+#endif
     Env* envs = (Env*)vec->envs;
     for (int i = 0; i < vec->size; i++) {
         c_reset(&envs[i]);
@@ -610,6 +662,9 @@ void create_static_threads(StaticVec* vec, int num_threads, int horizon,
 void static_vec_close(StaticVec* vec) {
     Env* envs = (Env*)vec->envs;
 
+#ifdef MY_GPU_NATIVE
+    if (vec->gpu) my_gpu_close();
+#endif
     if (vec->threading != NULL) {
         atomic_store(&vec->threading->shutdown, 1);
         for (int i = 0; i < vec->buffers; i++) {
@@ -663,6 +718,14 @@ void static_vec_close(StaticVec* vec) {
 }
 
 static inline float static_vec_aggregate_logs(StaticVec* vec, Log* out) {
+#ifdef MY_GPU_NATIVE
+    memset(out, 0, sizeof(Log));
+    float gpu_n = my_gpu_log_into(out);
+    if (gpu_n == 0.0f) return 0;
+    int gpu_nk = sizeof(Log) / sizeof(float);
+    for (int j = 0; j < gpu_nk; j++) ((float*)out)[j] /= gpu_n;
+    return gpu_n;
+#endif
     Env* envs = (Env*)vec->envs;
     memset(out, 0, sizeof(Log));
     int num_keys = sizeof(Log) / sizeof(float);

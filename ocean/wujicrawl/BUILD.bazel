@@ -1,0 +1,33 @@
+# Bazel targets for the wujicrawl CPU task (built from the kalki workspace).
+# The GPU-native training path (binding.c + wujicrawl_host.cu +
+# wujicrawl_warp.py) is built by PufferLib's build.sh instead and does not
+# use these targets; wujicrawl.cc is the C-MuJoCo mirror of that task behind
+# the kalki_env.h ABI.
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(
+    default_visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "wujicrawl_task",
+    srcs = ["wujicrawl.cc"],
+    deps = [
+        "//rl/env:kalki_env",
+        "@mujoco",
+    ],
+)
+
+# Self-contained env shared library: the kalki_env.h C ABI symbols are
+# exported and @mujoco is linked in statically.
+#   bazel build //rl/PufferLib/ocean/wujicrawl:wujicrawl_env_shared
+#   -> bazel-bin/rl/PufferLib/ocean/wujicrawl/libwujicrawl_env.so
+cc_shared_library(
+    name = "wujicrawl_env_shared",
+    shared_lib_name = "libwujicrawl_env.so",
+    deps = [
+        ":wujicrawl_task",
+        "//rl/env:kalki_env",
+    ],
+)

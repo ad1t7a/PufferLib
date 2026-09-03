@@ -1,0 +1,31 @@
+# Bazel targets for the wuji task (built from the kalki workspace; this file
+# is not used by PufferLib's build.sh, which only compiles binding.c and
+# links the shared lib below).
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(
+    default_visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "wuji_task",
+    srcs = ["wuji.cc"],
+    deps = [
+        "//rl/env:kalki_env",
+        "@mujoco",
+    ],
+)
+
+# Self-contained env shared library for PufferLib: the kalki_env.h C ABI
+# symbols are exported and @mujoco is linked in statically.
+#   bazel build //rl/PufferLib/ocean/wuji:wuji_env_shared
+#   -> bazel-bin/rl/PufferLib/ocean/wuji/libwuji_env.so
+cc_shared_library(
+    name = "wuji_env_shared",
+    shared_lib_name = "libwuji_env.so",
+    deps = [
+        ":wuji_task",
+        "//rl/env:kalki_env",
+    ],
+)

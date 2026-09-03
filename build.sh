@@ -134,6 +134,28 @@ elif [ "$ENV" = "nethack" ]; then
     INCLUDES+=(-I./$NLE_DIR/include
                -I./$NLE_DIR/build/_deps/deboost_context-src/include)
     EXTRA_LDFLAGS+=(-L"$NETHACK_LIB_DIR" -lnethack -Wl,-rpath,"$NETHACK_LIB_DIR" -ldl)
+elif [ "$ENV" = "wujicrawl" ]; then
+    SRC_DIR="ocean/$ENV"
+    # GPU-native mjwarp hybrids: the Python side (*_warp.py) needs
+    # mujoco + mujoco-warp importable from the training venv at runtime.
+    if [ -n "$MODE" ]; then
+        echo "Error: $ENV is GPU-only (no --cpu/--local/--web builds)" && exit 1
+    fi
+elif [ "$ENV" = "wuji" ]; then
+    SRC_DIR="ocean/$ENV"
+    # binding.c is a thin shim over the kalki_env.h C ABI; the env itself
+    # (generic core + wuji task, MuJoCo statically inside) is built by bazel
+    # from the kalki workspace:
+    #   bazel build //rl/PufferLib/ocean/wuji:wuji_env_shared
+    KALKI_ENV_DIR="${KALKI_ENV_DIR:-../env}"
+    WUJI_SO="${WUJI_SO:-../../bazel-bin/rl/PufferLib/ocean/wuji/libwuji_env.so}"
+    if [ ! -f "$WUJI_SO" ]; then
+        echo "Error: $WUJI_SO not found. Run:" \
+             "bazel build //rl/PufferLib/ocean/wuji:wuji_env_shared" && exit 1
+    fi
+    WUJI_SO_ABS="$(cd "$(dirname "$WUJI_SO")" && pwd)/$(basename "$WUJI_SO")"
+    INCLUDES+=(-I"$KALKI_ENV_DIR")
+    EXTRA_LDFLAGS+=("$WUJI_SO_ABS" -Wl,-rpath,"$(dirname "$WUJI_SO_ABS")")
 elif [ -d "ocean/$ENV" ]; then
     SRC_DIR="ocean/$ENV"
 else
@@ -270,6 +292,17 @@ ${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
     -fPIC -fopenmp \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
+
+# GPU-native envs: nvcc-compile ocean/<env>/*_gpu.cu into the
+# env static lib. Python.h is needed for envs that bootstrap an in-process
+# Python side (mjwarp hybrid). GPU builds only.
+if [ -z "$MODE" ] && ls "$SRC_DIR"/*.cu >/dev/null 2>&1; then
+    echo "Compiling CUDA env sources for $ENV..."
+    $NVCC -c -O2 -arch=$ARCH -Xcompiler -fPIC -std=c++17 \
+        -I. -Isrc -I"$SRC_DIR" -I$CUDA_HOME/include -I$PYTHON_INCLUDE \
+        "$SRC_DIR"/*.cu -o "build/${ENV}_gpu.o"
+    ar rcs "$STATIC_LIB" "$STATIC_OBJ" "build/${ENV}_gpu.o"
+fi
 
 # Brittle hack: have to extract the tensor type from the static lib to build trainer
 OBS_TENSOR_T=$(awk '/^#define OBS_TENSOR_T/{print $3}' "$BINDING_SRC")
