@@ -99,6 +99,7 @@ INCLUDES=(-I./$RAYLIB_NAME/include -I./src -I./vendor)
 LINK_ARCHIVES=("$RAYLIB_A")
 EXTRA_SRC=""
 EXTRA_LDFLAGS=()
+EXTRA_NVCCFLAGS=()
 
 if [ "$ENV" = "constellation" ]; then
     SRC_DIR="constellation"
@@ -134,28 +135,21 @@ elif [ "$ENV" = "nethack" ]; then
     INCLUDES+=(-I./$NLE_DIR/include
                -I./$NLE_DIR/build/_deps/deboost_context-src/include)
     EXTRA_LDFLAGS+=(-L"$NETHACK_LIB_DIR" -lnethack -Wl,-rpath,"$NETHACK_LIB_DIR" -ldl)
-elif [ "$ENV" = "wujicrawl" ]; then
-    SRC_DIR="ocean/$ENV"
-    # GPU-native mjwarp hybrids: the Python side (*_warp.py) needs
-    # mujoco + mujoco-warp importable from the training venv at runtime.
+elif [ "$ENV" = "wuji" ]; then
+    # Kalki env: lives in the kalki workspace (rl/ocean/wuji), not in this
+    # fork's ocean/. GPU-native mjwarp hybrid — the Python side (wuji_warp.py)
+    # needs mujoco + mujoco-warp importable from the training venv at runtime.
+    SRC_DIR="${KALKI_OCEAN_DIR:-../ocean}/$ENV"
+    if [ ! -d "$SRC_DIR" ]; then
+        echo "Error: $SRC_DIR not found (set KALKI_OCEAN_DIR)" && exit 1
+    fi
     if [ -n "$MODE" ]; then
         echo "Error: $ENV is GPU-only (no --cpu/--local/--web builds)" && exit 1
     fi
-elif [ "$ENV" = "wuji" ]; then
-    SRC_DIR="ocean/$ENV"
-    # binding.c is a thin shim over the kalki_env.h C ABI; the env itself
-    # (generic core + wuji task, MuJoCo statically inside) is built by bazel
-    # from the kalki workspace:
-    #   bazel build //rl/PufferLib/ocean/wuji:wuji_env_shared
-    KALKI_ENV_DIR="${KALKI_ENV_DIR:-../env}"
-    WUJI_SO="${WUJI_SO:-../../bazel-bin/rl/PufferLib/ocean/wuji/libwuji_env.so}"
-    if [ ! -f "$WUJI_SO" ]; then
-        echo "Error: $WUJI_SO not found. Run:" \
-             "bazel build //rl/PufferLib/ocean/wuji:wuji_env_shared" && exit 1
-    fi
-    WUJI_SO_ABS="$(cd "$(dirname "$WUJI_SO")" && pwd)/$(basename "$WUJI_SO")"
-    INCLUDES+=(-I"$KALKI_ENV_DIR")
-    EXTRA_LDFLAGS+=("$WUJI_SO_ABS" -Wl,-rpath,"$(dirname "$WUJI_SO_ABS")")
+    # mjwarp_host.cuh exec's the task module by path; bake in the absolute one
+    # so training works from any cwd (WUJI_PY still overrides at runtime).
+    SRC_DIR_ABS="$(cd "$SRC_DIR" && pwd)"
+    EXTRA_NVCCFLAGS+=(-DMJWARP_PY_PATH="\"$SRC_DIR_ABS/${ENV}_warp.py\"")
 elif [ -d "ocean/$ENV" ]; then
     SRC_DIR="ocean/$ENV"
 else
@@ -300,6 +294,7 @@ if [ -z "$MODE" ] && ls "$SRC_DIR"/*.cu >/dev/null 2>&1; then
     echo "Compiling CUDA env sources for $ENV..."
     $NVCC -c -O2 -arch=$ARCH -Xcompiler -fPIC -std=c++17 \
         -I. -Isrc -I"$SRC_DIR" -I$CUDA_HOME/include -I$PYTHON_INCLUDE \
+        "${EXTRA_NVCCFLAGS[@]}" \
         "$SRC_DIR"/*.cu -o "build/${ENV}_gpu.o"
     ar rcs "$STATIC_LIB" "$STATIC_OBJ" "build/${ENV}_gpu.o"
 fi

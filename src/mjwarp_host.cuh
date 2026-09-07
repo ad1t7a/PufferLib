@@ -11,8 +11,8 @@
 //   * bridge reset / log / render back into the Python module.
 //
 // A concrete env is a tiny shim .cu (nvcc-compiled by build.sh):
-//   #define MJWARP_ENV_NAME "wujicrawl"
-//   #define MJWARP_PY_ENVVAR "WUJICRAWL_PY"
+//   #define MJWARP_ENV_NAME "wuji"
+//   #define MJWARP_PY_ENVVAR "WUJI_PY"
 //   #include "mjwarp_host.cuh"
 // and its binding.c (under MY_GPU_NATIVE) hooks in with:
 //   void mjwarp_set_env_kwargs(Dict* kwargs);
@@ -34,10 +34,16 @@
 #pragma once
 
 #ifndef MJWARP_ENV_NAME
-#error "define MJWARP_ENV_NAME (e.g. \"wujicrawl\") before including mjwarp_host.cuh"
+#error "define MJWARP_ENV_NAME (e.g. \"wuji\") before including mjwarp_host.cuh"
 #endif
 #ifndef MJWARP_PY_ENVVAR
-#error "define MJWARP_PY_ENVVAR (e.g. \"WUJICRAWL_PY\") before including mjwarp_host.cuh"
+#error "define MJWARP_PY_ENVVAR (e.g. \"WUJI_PY\") before including mjwarp_host.cuh"
+#endif
+// Fallback path to <env>_warp.py when MJWARP_PY_ENVVAR is unset. Relative
+// paths resolve against the cwd (the PufferLib repo root, where build.sh and
+// `puffer train` run), so an env living outside ocean/ overrides this.
+#ifndef MJWARP_PY_PATH
+#define MJWARP_PY_PATH "ocean/" MJWARP_ENV_NAME "/" MJWARP_ENV_NAME "_warp.py"
 #endif
 // Must equal sizeof(Log)/sizeof(float) in the env's binding.c.
 #ifndef MJWARP_LOG_FLOATS
@@ -107,7 +113,7 @@ void my_gpu_init(int total_agents, int num_buffers, unsigned int seed,
     int n = snprintf(code, sizeof(code),
         "import importlib.util as _ilu, os as _os\n"
         "_p = _os.environ.get('" MJWARP_PY_ENVVAR "', "
-        "'ocean/" MJWARP_ENV_NAME "/" MJWARP_ENV_NAME "_warp.py')\n"
+        "'" MJWARP_PY_PATH "')\n"
         "_spec = _ilu.spec_from_file_location('" MJWARP_ENV_NAME "_warp', _p)\n"
         "_mjwarp_mod = _ilu.module_from_spec(_spec)\n"
         "_spec.loader.exec_module(_mjwarp_mod)\n"

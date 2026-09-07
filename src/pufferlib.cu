@@ -456,7 +456,7 @@ __device__ __forceinline__ float safe_continuous_logstd(const precision_t* logst
 // step. safe_continuous_logstd only clamps at sample/logprob time; the
 // parameter is otherwise unbounded, and once the action mean runs away the
 // PPO logstd gradient ((a-mu)^2/sigma^2 - 1) stays positive and diverges
-// (observed logstd +29 / |mu|~1e5 on wujicrawl). Tighter than the sampling
+// (observed logstd +29 / |mu|~1e5 on the wuji crawl task). Tighter than the sampling
 // clamp so a policy pinned at the wall still behaves sanely and can recover.
 #define LOGSTD_PARAM_MIN -4.0f
 #define LOGSTD_PARAM_MAX 1.0f

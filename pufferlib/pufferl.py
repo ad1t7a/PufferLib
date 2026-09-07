@@ -610,14 +610,24 @@ def load_config(env_name):
         ' demo options. Shows valid args for your env and policy'
 
     repo_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    puffer_config_dir = os.path.join(repo_dir, 'config/**/*.ini')
     puffer_default_config = os.path.join(repo_dir, 'config/default.ini')
+    # Kalki envs live outside this fork (rl/ocean/<env>) and so do their
+    # configs (rl/configs/<env>.ini). Search both trees; PUFFER_CONFIG_DIR
+    # overrides the extra one.
+    kalki_config_dir = os.environ.get(
+        'PUFFER_CONFIG_DIR', os.path.join(repo_dir, '..', 'configs'))
+    config_globs = [
+        os.path.join(repo_dir, 'config/**/*.ini'),
+        os.path.join(kalki_config_dir, '**/*.ini'),
+    ]
     #CC: Remove the default. Just raise an error on "puffer train" etc with no env (think we already do)
     if env_name == 'default':
         p = configparser.ConfigParser()
         p.read(puffer_default_config)
     else:
-        for path in glob.glob(puffer_config_dir, recursive=True):
+        paths = [path for pattern in config_globs
+                 for path in glob.glob(pattern, recursive=True)]
+        for path in paths:
             p = configparser.ConfigParser()
             p.read([puffer_default_config, path])
             if env_name in p['base']['env_name'].split(): break

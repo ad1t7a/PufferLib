@@ -25,7 +25,7 @@ dependencies = [
     "scikit-learn",
     "wandb",
     "pybind11",
-    # kalki GPU-native envs (ocean/wujigpu, ocean/wujicrawl): in-process
+    # kalki GPU-native envs (../ocean/wuji): in-process
     # mujoco_warp physics + CPU mujoco for model tooling and the viewer.
     "mujoco>=3.12",
     "mujoco-warp>=3.12",
