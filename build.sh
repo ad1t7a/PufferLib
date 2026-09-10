@@ -319,7 +319,7 @@ if [ -z "$MODE" ]; then
         -Xcompiler=-fopenmp \
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
-        $PRECISION $NVCC_OPT \
+        $PRECISION $NVCC_OPT $PUFFER_TRAIN_FLAGS \
         src/bindings.cu -o build/bindings.o
 
     LINK_CMD=(

@@ -104,6 +104,11 @@ struct TrainGraph {
     PrecisionTensor mb_newvalue;
     PrecisionTensor mb_prio;        // (B,)
     PrecisionTensor mb_action_mask; // (B, T, mask_size); .data=nullptr when disabled
+#ifdef G1_MIRROR_LOSS
+    PrecisionTensor mb_obs_mir;     // (B, T, input_size)  mirrored obs (N1 symmetry loss)
+    PrecisionTensor mb_state_mir;   // (num_layers, B, H)  zeroed init state for mirror fwd
+    PrecisionTensor mir_dec;        // (B, T, num_atns+1)  copied mirror decoder output
+#endif
 };
 
 void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, int input_size,
@@ -135,6 +140,14 @@ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, in
         bufs.mb_action_mask = {.shape = {B, T, mask_size}};
         alloc_register(alloc, &bufs.mb_action_mask);
     }
+#ifdef G1_MIRROR_LOSS
+    bufs.mb_obs_mir   = {.shape = {B, T, input_size}};
+    bufs.mb_state_mir = {.shape = {num_layers, B, hidden_size}};
+    bufs.mir_dec      = {.shape = {B, T, num_atns + 1}};
+    alloc_register(alloc, &bufs.mb_obs_mir);
+    alloc_register(alloc, &bufs.mb_state_mir);
+    alloc_register(alloc, &bufs.mir_dec);
+#endif
 }
 
 // PPO buffers + args are quite complex. We do the entire
@@ -1562,6 +1575,40 @@ inline float cosine_annealing(float lr_base, float lr_min, long t, long T) {
     return lr_min + 0.5f*(lr_base - lr_min)*(1.0f + std::cos(M_PI * ratio));
 }
 
+#ifdef G1_MIRROR_LOSS
+#include "../../ocean/unitree_g1/unitree_g1_mirror.h"
+// N1 symmetry loss (Yu 2018), ported from nanoG1. Mirror the minibatch obs
+// (rows = B*T) with the involution-checked G1-23dof map.
+__global__ void g1_mirror_obs_kernel(const precision_t* __restrict__ src,
+        precision_t* __restrict__ dst, int rows) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * G1_MIRROR_OBS) return;
+    int r = idx / G1_MIRROR_OBS, j = idx % G1_MIRROR_OBS;
+    dst[(size_t)r * G1_MIRROR_OBS + j] =
+        from_float(G1_OBS_MIRROR_SIGN[j] * to_float(src[(size_t)r * G1_MIRROR_OBS + G1_OBS_MIRROR_SRC[j]]));
+}
+// Add the symmetry-loss gradient to the PPO grads. The mirrored forward provides a
+// STOP-GRAD target mirror_act(mu_mir); gradient flows only through the original
+// branch (same symmetric fixed point, one backward). fused = A_total+1 (mean[0:A],
+// value[A]). Scale by 1/rows to match PPO's 1/(N*T) mean.
+__global__ void g1_sym_grad_kernel(const precision_t* __restrict__ dec_orig,
+        const precision_t* __restrict__ dec_mir, float* __restrict__ grad_logits,
+        float* __restrict__ grad_values, int rows, int A, int fused, float coef) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * A) return;
+    int r = idx / A, j = idx % A;
+    float c = coef / (float)rows;
+    float mu_orig = to_float(dec_orig[(size_t)r * fused + j]);
+    float mu_m    = G1_ACT_MIRROR_SIGN[j] * to_float(dec_mir[(size_t)r * fused + G1_ACT_MIRROR_SRC[j]]);
+    grad_logits[(size_t)r * A + j] += c * (mu_orig - mu_m);
+    if (j == 0) {
+        float v_orig = to_float(dec_orig[(size_t)r * fused + A]);
+        float v_m    = to_float(dec_mir[(size_t)r * fused + A]);
+        grad_values[r] += c * (v_orig - v_m);
+    }
+}
+#endif
+
 void train_impl(PuffeRL& pufferl) {
     // Update to HypersT& p
     HypersT& hypers = pufferl.hypers;
@@ -1693,6 +1740,22 @@ void train_impl(PuffeRL& pufferl) {
             cudaStream_t stream = train_stream;
             PrecisionTensor obs_puf = graph.mb_obs;
             PrecisionTensor state_puf = graph.mb_state;
+#ifdef G1_MIRROR_LOSS
+            // N1: forward the mirrored obs FIRST (writes train_activations, then the
+            // original forward below overwrites them). Copy out its decoder output as
+            // the stop-grad symmetry target before it's clobbered.
+            {
+                int rows_m = graph.mb_obs.shape[0] * graph.mb_obs.shape[1];
+                g1_mirror_obs_kernel<<<grid_size(rows_m * G1_MIRROR_OBS), BLOCK_SIZE, 0, stream>>>(
+                    graph.mb_obs.data, graph.mb_obs_mir.data, rows_m);
+                cudaMemsetAsync(graph.mb_state_mir.data, 0,
+                    (size_t)numel(graph.mb_state_mir.shape) * sizeof(precision_t), stream);
+                PrecisionTensor mir_dec = policy_forward_train(&pufferl.policy, pufferl.weights,
+                    pufferl.train_activations, graph.mb_obs_mir, graph.mb_state_mir, stream);
+                cudaMemcpyAsync(graph.mir_dec.data, mir_dec.data,
+                    (size_t)numel(mir_dec.shape) * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
+            }
+#endif
             PrecisionTensor dec_puf = policy_forward_train(&pufferl.policy, pufferl.weights, pufferl.train_activations, obs_puf, state_puf, stream);
             DecoderWeights* dw_train = (DecoderWeights*)pufferl.weights.decoder;
             PrecisionTensor p_logstd;
@@ -1705,6 +1768,17 @@ void train_impl(PuffeRL& pufferl) {
                 hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef,
                 pufferl.ppo_bufs_puf.ent_coef.data,
                 pufferl.ppo_bufs_puf, pufferl.is_continuous, stream);
+#ifdef G1_MIRROR_LOSS
+            {
+                int rows_m = dec_puf.shape[0] * dec_puf.shape[1];
+                int fused_m = dec_puf.shape[2];
+                int A_m = fused_m - 1;  // continuous head: mean[0:A], value[A]
+                g1_sym_grad_kernel<<<grid_size(rows_m * A_m), BLOCK_SIZE, 0, stream>>>(
+                    dec_puf.data, graph.mir_dec.data,
+                    pufferl.ppo_bufs_puf.grad_logits.data, pufferl.ppo_bufs_puf.grad_values.data,
+                    rows_m, A_m, fused_m, (float)(G1_MIRROR_LOSS));
+            }
+#endif
 
             FloatTensor grad_logits_puf = pufferl.ppo_bufs_puf.grad_logits;
             FloatTensor grad_logstd_puf = pufferl.is_continuous ? pufferl.ppo_bufs_puf.grad_logstd : FloatTensor();
