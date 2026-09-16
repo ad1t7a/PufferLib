@@ -135,7 +135,7 @@ elif [ "$ENV" = "nethack" ]; then
     INCLUDES+=(-I./$NLE_DIR/include
                -I./$NLE_DIR/build/_deps/deboost_context-src/include)
     EXTRA_LDFLAGS+=(-L"$NETHACK_LIB_DIR" -lnethack -Wl,-rpath,"$NETHACK_LIB_DIR" -ldl)
-elif [ "$ENV" = "tzk" ] || [ "$ENV" = "unitree_g1" ]; then
+elif [ "$ENV" = "tzk" ] || [ "$ENV" = "unitree_g1" ] || [ "$ENV" = "wuji" ]; then
     # Kalki env: lives in the kalki workspace (rl/ocean/$ENV), not in this
     # fork's ocean/. GPU-native mjwarp hybrid — the Python side ($ENV_warp.py)
     # needs mujoco + mujoco-warp importable from the training venv at runtime.
