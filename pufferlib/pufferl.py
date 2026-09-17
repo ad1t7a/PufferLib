@@ -470,6 +470,10 @@ def eval(env_name, args=None, load_path=None):
     args = args or load_config(env_name)
     args['reset_state'] = False
     args['train']['horizon'] = 1
+    # Deploy-style eval: continuous policies emit the Gaussian mean rather than
+    # sampling exploration noise. Pass deterministic=False to watch the
+    # stochastic policy as seen during training.
+    args.setdefault('deterministic', True)
 
     backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)

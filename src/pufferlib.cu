@@ -319,6 +319,8 @@ typedef struct {
     float prio_beta0;
     // Flags
     bool reset_state;
+    // Eval: emit the Gaussian mean instead of sampling (continuous only).
+    bool deterministic;
     int cudagraphs;
     bool profile;
     // Multi-GPU
@@ -529,7 +531,8 @@ __global__ void sample_logits(
         const precision_t* __restrict__ action_mask, // (B, A_total) or nullptr
         int mask_stride,                      // 0 when action_mask is nullptr
         const signed char* __restrict__ head_consume, // (nverbs, num_atns) or nullptr
-        int hc_stride) {
+        int hc_stride,
+        int deterministic) {                  // 1: continuous actions = mean (eval)
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
     int num_atns = numel(act_sizes_puf.shape);
@@ -564,7 +567,7 @@ __global__ void sample_logits(
             float std = expf(log_std);
 
             // Sample from N(0,1) and transform: action = mean + std * noise
-            float noise = curand_normal(&state);
+            float noise = deterministic ? 0.0f : curand_normal(&state);
             float action = finite_or_clamp(mean + std * noise, -1.0e6f, 1.0e6f);
 
             precision_t stored_action_p = from_float(action);
@@ -767,7 +770,8 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
             dec_puf, p_logstd, pufferl->act_sizes_puf,
             act_b.data, lp_b.data, val_b.data,
             pufferl->rng_states[buf] + bank_off,
-            mask_b.data, mask_stride_b, hc_dev_s, hc_stride_s);
+            mask_b.data, mask_stride_b, hc_dev_s, hc_stride_s,
+            pufferl->hypers.deterministic ? 1 : 0);
 
         cast<<<grid_size(numel(act_b.shape)), BLOCK_SIZE, 0, stream>>>(
                 env.actions.data + (long)sub_start * act_cols,
